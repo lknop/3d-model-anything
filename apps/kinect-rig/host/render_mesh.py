@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Render a reconstructed room mesh to preview images (no GPU or display needed).
 
-usage: render_mesh.py <mesh.ply> -o PREFIX [--cut 1.6] [--band LOW HIGH]
+usage: render_mesh.py <mesh.ply> -o PREFIX [--cut 1.6] [--band LOW HIGH] [--photos BUNDLE I [I ...]]
 
 Expects the bundle's world: meters, +Y up. Heights are measured from the main floor, found as the
 most common height of upward-facing surfaces. Writes
@@ -10,6 +10,8 @@ most common height of upward-facing surfaces. Writes
   PREFIX-height.jpg  straight down, colored by height above the floor; --band (meters relative to
                      the floor) is painted magenta to locate a suspect layer
 Everything above --cut meters over the floor is removed so the views look into the room.
+--photos renders the whole mesh from bundle photos' own cameras next to the photos:
+  PREFIX-photo-NNNN.jpg  photo | scan seen from the same pose and intrinsics (raw sensor orientation)
 """
 import argparse
 
@@ -61,6 +63,27 @@ def render(mesh, size, view, extent, center):
     return img
 
 
+def render_camera(mesh, cam_to_world, k, size):
+    """The mesh as the given camera sees it (bundle convention: camera looks down -Z, +Y up)."""
+    w, h = size
+    v = np.asarray(mesh.vertices)
+    tris = np.asarray(mesh.triangles)
+    colors = (np.asarray(mesh.vertex_colors)[tris].mean(1)[:, ::-1] * 255).astype(np.uint8)
+    cam = (v - cam_to_world[:3, 3]) @ cam_to_world[:3, :3]  # world → camera axes
+    depth = -cam[:, 2]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        uv = np.c_[k[0] * cam[:, 0] / depth + k[2], k[1] * -cam[:, 1] / depth + k[3]]
+    td = depth[tris]
+    tuv = uv[tris]
+    visible = (td > 0.1).all(1) & (np.abs(tuv) < 4 * max(w, h)).all((1, 2))
+    img = np.full((h, w, 3), (28, 23, 23), np.uint8)
+    pts = np.round(np.nan_to_num(tuv) * 16).astype(np.int32)
+    for i in np.argsort(-td.mean(1)):
+        if visible[i]:
+            cv2.fillConvexPoly(img, pts[i], colors[i].tolist(), lineType=cv2.LINE_AA, shift=4)
+    return img
+
+
 def label(img, lines):
     for i, text in enumerate(lines):
         y = 30 + i * 28
@@ -76,9 +99,27 @@ def main():
     ap.add_argument('--cut', type=float, default=1.6, help='remove everything this far above the floor (m)')
     ap.add_argument('--band', type=float, nargs=2, metavar=('LOW', 'HIGH'), help='height band to highlight (m from floor)')
     ap.add_argument('--size', type=int, nargs=2, default=(1600, 1200))
+    ap.add_argument('--photos', nargs='+', metavar=('BUNDLE', 'I'), help='bundle folder, then photo indices')
     a = ap.parse_args()
 
     mesh = o3d.io.read_triangle_mesh(a.mesh)
+    if a.photos:
+        import json
+        import os
+        bundle = a.photos[0]
+        photos = json.load(open(os.path.join(bundle, 'photos', 'photos.json')))
+        for i in map(int, a.photos[1:]):
+            p = photos[i]
+            pose = np.array(p['transform']).reshape(4, 4).T
+            k = p['intrinsics']
+            scale = 960 / p['width']  # half resolution keeps it quick
+            size = (int(p['width'] * scale), int(p['height'] * scale))
+            scan = render_camera(mesh, pose, [k[0] * scale, k[4] * scale, k[6] * scale, k[7] * scale], size)
+            photo = cv2.resize(cv2.imread(os.path.join(bundle, p['file'])), size)
+            pair = np.hstack([label(photo, [f'photo {i}']), label(scan, ['scan from the same camera'])])
+            cv2.imwrite(f'{a.o}-photo-{i:04d}.jpg', pair, [cv2.IMWRITE_JPEG_QUALITY, 88])
+            print(f'{a.o}-photo-{i:04d}.jpg')
+        return
     floor = floor_height(mesh)
     v = np.asarray(mesh.vertices)
     mesh.remove_vertices_by_mask(v[:, 1] > floor + a.cut)
