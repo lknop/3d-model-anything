@@ -437,7 +437,7 @@ def main():
           f'floor outline {len(polygon)} corners → {os.path.join(a.bundle, rel)}')
     for w in walls:
         print(f"  wall {w['axis']}{'+' if w['sign'] > 0 else '-'} at {w['offset']:+.2f}: {w['u1'] - w['u0']:.2f} m long, "
-              (f"top {w['height']:.2f}-{max(p[1] for p in w['profile']) - floor_y:.2f} m" if w['profile']
+              + (f"top {w['height']:.2f}-{max(p[1] for p in w['profile']) - floor_y:.2f} m" if w['profile']
                  else f"top {w['height']:.2f} m (no ceiling face seen above)")
               + f", observed to {w['top']:.2f} m, {len(w['openings'])} openings")
     if a.plan:
