@@ -56,26 +56,35 @@ def load(session):
 
 def estimate_delay(p_times, p_rot, k_times, k_paths):
     """Lag (s) that best lines up Kinect image motion with phone angular speed."""
+    window = cv2.createHanningWindow((160, 120), cv2.CV_32F)
     flow, prev = [], None
     for path in k_paths:
         g = cv2.resize(cv2.imread(path, cv2.IMREAD_GRAYSCALE), (160, 120)).astype(np.float32)
         if prev is None:
             flow.append(0.0)
         else:
-            (dx, dy), _ = cv2.phaseCorrelate(prev, g)
+            (dx, dy), _ = cv2.phaseCorrelate(prev, g, window)
             flow.append(float(np.hypot(dx, dy)))
         prev = g
-    flow = np.array(flow) / np.gradient(k_times).clip(1e-3)
-    rel = (p_rot[:-1].inv() * p_rot[1:]).magnitude() / np.diff(p_times).clip(1e-3)
-    speed_t = (p_times[:-1] + p_times[1:]) / 2
+    flow = smooth(np.array(flow))
+    # ARCore occasionally repeats a frame time; those near-zero intervals would read as huge speeds
+    dt = np.diff(p_times)
+    ok = dt > 0.005
+    rel = (p_rot[:-1].inv() * p_rot[1:]).magnitude()[ok] / dt[ok]
+    speed_t = ((p_times[:-1] + p_times[1:]) / 2)[ok]
     lags = np.arange(-MAX_LAG_S, MAX_LAG_S + 1e-9, 0.005)
     scores = []
     for lag in lags:
-        phone_at_kinect = np.interp(k_times - lag, speed_t, rel, left=np.nan, right=np.nan)
+        phone_at_kinect = smooth(np.interp(k_times - lag, speed_t, rel, left=np.nan, right=np.nan))
         ok = np.isfinite(phone_at_kinect)
         scores.append(np.corrcoef(phone_at_kinect[ok], flow[ok])[0, 1] if ok.sum() > 30 else -1)
     best = int(np.nanargmax(scores))
     return float(lags[best]), float(scores[best])
+
+
+def smooth(x, n=5):
+    """Moving average over n frames (~170 ms), so single noisy frames don't decide the lag."""
+    return np.convolve(x, np.ones(n) / n, mode='same')
 
 
 def board_points(pattern, square):
@@ -100,6 +109,17 @@ def pose_from(obj, img, k):
     m[:3, 3] = tvec.ravel()
     proj, _ = cv2.projectPoints(obj, rvec, tvec, k, None)
     return m, float(np.sqrt(((proj.reshape(-1, 2) - img) ** 2).sum(1).mean()))
+
+
+def joint_transform(obj, pairs, k_kinect, k_phone, kinect_size):
+    """Kinect camera → phone camera (CV axes) over all views, intrinsics held fixed."""
+    rms, _, _, _, _, r, t, _, _ = cv2.stereoCalibrate(
+        [obj] * len(pairs), [p[2] for p in pairs], [p[1] for p in pairs], k_kinect, np.zeros(5), k_phone, np.zeros(5),
+        kinect_size, flags=cv2.CALIB_FIX_INTRINSIC)
+    m = np.eye(4)
+    m[:3, :3] = r
+    m[:3, 3] = t.ravel()
+    return m, rms
 
 
 def main():
@@ -157,13 +177,25 @@ def main():
     dev_deg = np.degrees((rots * mean_rot.inv()).magnitude())
     dev_mm = np.linalg.norm(trans - mean_t, axis=1) * 1000
 
-    cv_pose = np.eye(4)
-    cv_pose[:3, :3] = mean_rot.as_matrix()
-    cv_pose[:3, 3] = mean_t
+    axis_mm = np.std((CV_TO_GL[:3, :3] @ trans.T).T, axis=0) * 1000  # per phone-camera axis, GL: x right, y up, z back
+    print(f'per view: {keep.sum()}/{len(keep)} views kept, spread {np.median(dev_deg):.2f} deg, {np.median(dev_mm):.1f} mm median '
+          f'(std x/y/z {np.round(axis_mm, 1)} mm)')
+
+    # One transform for all kept views at once, minimizing corner error in both cameras; the
+    # per-view estimates above are each limited by how few Kinect pixels the board covers.
+    kept = [p for p, k in zip(pairs, keep) if k]
+    k_phone = np.median([[[p[0]['intrinsics']['fx'], 0, p[0]['intrinsics']['cx']], [0, p[0]['intrinsics']['fy'], p[0]['intrinsics']['cy']],
+                          [0, 0, 1]] for p in kept], axis=0)
+    cv_pose, joint_rms = joint_transform(obj, kept, k_kinect, k_phone, kinect_size)
+    rng = np.random.default_rng(0)
+    boot = [joint_transform(obj, [kept[i] for i in rng.integers(0, len(kept), len(kept))], k_kinect, k_phone, kinect_size)[0]
+            for _ in range(30)]
+    boot_mm = np.std([(CV_TO_GL[:3, :3] @ b[:3, 3]) for b in boot], axis=0) * 1000
+    boot_deg = float(np.degrees(np.std([Rotation.from_matrix(b[:3, :3] @ cv_pose[:3, :3].T).magnitude() for b in boot])))
     gl_pose = CV_TO_GL @ cv_pose @ CV_TO_GL  # same axis flip on both cameras
     euler = Rotation.from_matrix(gl_pose[:3, :3]).as_euler('xyz', degrees=True)
-    print(f'phone → Kinect: offset {np.round(gl_pose[:3, 3] * 100, 1)} cm, rotation xyz {np.round(euler, 1)} deg '
-          f'(from {keep.sum()}/{len(keep)} views; spread {np.median(dev_deg):.2f} deg, {np.median(dev_mm):.1f} mm median)')
+    print(f'phone → Kinect (joint): offset {np.round(gl_pose[:3, 3] * 100, 1)} cm, rotation xyz {np.round(euler, 1)} deg, '
+          f'corner error {joint_rms:.2f} px; uncertainty x/y/z {np.round(boot_mm, 1)} mm, {boot_deg:.2f} deg')
 
     result = {
         'format': 'kinect-rig-calibration/1',
@@ -174,8 +206,10 @@ def main():
         'kinectIntrinsics': [float(k_kinect[0, 0]), float(k_kinect[1, 1]), float(k_kinect[0, 2]), float(k_kinect[1, 2])],
         'kinectDistortion': [float(v) for v in dist.ravel()],
         'quality': {'views': int(keep.sum()), 'viewsRejected': int((~keep).sum()), 'motionCorrelation': round(corr, 3),
-                    'kinectReprojectionPx': round(float(rms), 3),
-                    'spreadDegMedian': round(float(np.median(dev_deg)), 3), 'spreadMmMedian': round(float(np.median(dev_mm)), 2)},
+                    'kinectReprojectionPx': round(float(rms), 3), 'jointReprojectionPx': round(float(joint_rms), 3),
+                    'uncertaintyMm': [round(float(v), 2) for v in boot_mm], 'uncertaintyDeg': round(boot_deg, 3),
+                    'perViewSpreadDegMedian': round(float(np.median(dev_deg)), 3),
+                    'perViewSpreadMmMedian': round(float(np.median(dev_mm)), 2)},
         'board': {'innerCorners': list(pattern), 'squareM': a.square},
         'conventions': 'phoneToKinect: Kinect RGB camera pose in the phone camera frame; camera axes x right, y up, '
                        'z back (sensor orientation); column-major. Kinect pose = phone pose @ phoneToKinect.',
