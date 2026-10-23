@@ -2,7 +2,8 @@
 """Convert a rig session (or a TUM RGB-D sequence) into a house-capture/5 session bundle, so the
 scan-to-threejs scripts (reconstruct_bundle.py, bundle_to_room.py, prepare_photos.py) can use it.
 
-usage: rig_to_bundle.py <session> -o BUNDLE [--kinect-poses trajectory.txt] [--calibration rig.json]
+usage: rig_to_bundle.py <session> -o BUNDLE [--kinect-poses trajectory.txt]
+                        [--calibration rig.json [--write-prior prior.txt] [--refined trajectory.txt]]
                         [--depth-every 3] [--photo-every 1.0]
 
 Photos: the phone's keyframes (ARCore poses, 1920x1080) when the session has them; otherwise the
@@ -10,6 +11,9 @@ sharpest Kinect RGB frame of every --photo-every seconds. Depth: every --depth-e
 posed by one of
   --calibration    phone pose x phone-to-Kinect transform (rig.json: phoneToKinect, kinectLatencyMs,
                    kinectIntrinsics). Everything shares ARCore's gravity-aligned world.
+                   --write-prior saves these Kinect poses for rig_refine.py (no -o needed);
+                   --refined takes its trajectory back: Kinect frames use the refined poses and each
+                   photo gets the correction of the Kinect frame nearest in time.
   --kinect-poses   a Kinect trajectory from kinect_fusion.py (Kinect-only mode). Its world is the
                    first Kinect camera, turned so +Y is that camera's up: level only if it was.
                    Phone photos cannot be placed in it and are left out.
@@ -52,8 +56,9 @@ def upright(cam_to_world):
     return max(options, key=options.get)
 
 
-def phone_photos(rec_dir, out):
-    """ARCore keyframes → photo records; images are copied unchanged (sensor orientation)."""
+def phone_photos(rec_dir, out, correct=None, offset_ns=0):
+    """ARCore keyframes → photo records; images are copied unchanged (sensor orientation).
+    correct(laptop_time) → 4x4 world correction applied to the ARCore pose."""
     records = []
     for line in open(os.path.join(rec_dir, 'keyframes.jsonl')):
         k = json.loads(line)
@@ -63,6 +68,8 @@ def phone_photos(rec_dir, out):
         m = np.eye(4)
         m[:3, :3] = Rotation.from_quat(k['pose'][3:7]).as_matrix()
         m[:3, 3] = k['pose'][:3]
+        if correct is not None:
+            m = correct((k['t_ns'] - offset_ns) / 1e9) @ m
         name = f'photos/{len(records):04d}.jpg'
         shutil.copyfile(src, os.path.join(out, name))
         i = k['intrinsics']
@@ -136,24 +143,29 @@ def write_depth(frames, poses, intr, depth_scale, out, every):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('session', help='rig session folder or TUM RGB-D sequence')
-    ap.add_argument('-o', required=True, help='new bundle folder')
+    ap.add_argument('-o', help='new bundle folder')
     ap.add_argument('--kinect-poses', help='Kinect-only mode: trajectory.txt from kinect_fusion.py')
     ap.add_argument('--calibration', help='rig mode: rig.json with phoneToKinect, kinectLatencyMs, kinectIntrinsics')
+    ap.add_argument('--write-prior', help='rig mode: write the ARCore-derived Kinect poses here (TUM, CV camera axes)')
+    ap.add_argument('--refined', help='rig mode: refined Kinect trajectory from rig_refine.py')
     ap.add_argument('--depth-every', type=int, default=3, help='keep every Nth Kinect frame as a depth frame')
     ap.add_argument('--photo-every', type=float, default=1.0, help='Kinect-only photos: one per this many seconds')
     a = ap.parse_args()
-    if os.path.exists(a.o):
+    if not a.o and not a.write_prior:
+        ap.error('give -o (and/or --write-prior)')
+    if a.o and os.path.exists(a.o):
         ap.error(f'{a.o} exists; choose a new folder')
     if a.kinect_poses and a.calibration:
         ap.error('use --kinect-poses or --calibration, not both')
+    if (a.write_prior or a.refined) and not a.calibration:
+        ap.error('--write-prior and --refined need --calibration')
 
     is_tum = os.path.exists(os.path.join(a.session, 'depth.txt'))
     rec_dir = os.path.join(a.session, 'phone', 'recording')
     has_phone = os.path.exists(os.path.join(rec_dir, 'keyframes.jsonl'))
     has_kinect = is_tum or os.path.exists(os.path.join(a.session, 'kinect', 'frames.jsonl'))
-    os.makedirs(os.path.join(a.o, 'photos'))
-    os.makedirs(os.path.join(a.o, 'depth'))
     notes = []
+    correct, offset = None, 0
 
     frames, depth_scale, intr = sequence.load(a.session) if has_kinect else ([], 1000.0, sequence.DEFAULT_INTRINSICS)
     kinect_poses = [None] * len(frames)
@@ -181,11 +193,40 @@ def main():
             phone = traj.interpolate(p_times, p_poses, t - latency)
             kinect_poses.append(None if phone is None else phone @ phone_to_kinect)
         notes.append(f'rig: Kinect posed from ARCore via {os.path.basename(a.calibration)}')
+        if a.write_prior:
+            keep = [i for i, p in enumerate(kinect_poses) if p is not None]
+            traj.write_tum(a.write_prior, np.array([frames[i][0] for i in keep]),
+                           np.array([kinect_poses[i] @ CV_TO_GL for i in keep]),
+                           'Kinect camera-to-world from ARCore x calibration; CV camera axes, ARCore world (y up)')
+            print(f'prior: {len(keep)} Kinect poses → {a.write_prior}')
+            if not a.o:
+                return
+        if a.refined:
+            r_times, r_poses = traj.read_tum(a.refined)
+            fixes, fix_times, moved = [], [], []
+            for n, (t, _, _) in enumerate(frames):
+                r = traj.interpolate(r_times, r_poses, t)
+                if r is None or kinect_poses[n] is None:
+                    kinect_poses[n] = None
+                    continue
+                refined = r @ CV_TO_GL
+                moved.append(np.linalg.norm(refined[:3, 3] - kinect_poses[n][:3, 3]))
+                fixes.append(refined @ np.linalg.inv(kinect_poses[n]))
+                fix_times.append(t - latency)
+                kinect_poses[n] = refined
+            fix_times = np.array(fix_times)
+            correct = lambda when: fixes[int(np.argmin(np.abs(fix_times - when)))]  # noqa: E731
+            offset = session['clock']['offset_ns']
+            moved = np.array(moved)
+            notes.append(f'refined by {os.path.basename(a.refined)}: correction median {np.median(moved) * 100:.1f} cm, '
+                         f'max {moved.max() * 100:.1f} cm; photos take the nearest Kinect frame\'s correction')
     elif has_kinect:
         notes.append('Kinect frames skipped: give --kinect-poses (Kinect-only) or --calibration (rig)')
 
+    os.makedirs(os.path.join(a.o, 'photos'))
+    os.makedirs(os.path.join(a.o, 'depth'))
     if has_phone and not a.kinect_poses:
-        photos = phone_photos(rec_dir, a.o)
+        photos = phone_photos(rec_dir, a.o, correct, offset)
     elif has_kinect and a.kinect_poses:
         photos = kinect_photos(frames, kinect_poses, intr, a.o, a.photo_every)
         if has_phone:
@@ -208,7 +249,7 @@ def main():
         'rooms': [], 'photos': 'photos/photos.json', 'photoCount': len(photos),
         'depthFrames': 'depth/frames.json', 'depthFrameCount': len(depth), 'mesh': None,
         'kinectRig': {'source': os.path.abspath(a.session), 'notes': notes,
-                      'kinectIntrinsics': list(intr), 'calibrated': bool(a.calibration)},
+                      'kinectIntrinsics': list(intr), 'calibrated': bool(a.calibration), 'refined': bool(a.refined)},
     }
     json.dump(manifest, open(os.path.join(a.o, 'manifest.json'), 'w'), indent=2)
     print(f'{len(photos)} photos, {len(depth)} depth frames → {a.o}')
