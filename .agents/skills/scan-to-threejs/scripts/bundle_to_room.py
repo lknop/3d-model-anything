@@ -165,7 +165,9 @@ def main():
             'front': [round(f[0], 3), round(f[2], 3)],
         })
 
-    # --- photos (upright framing: image up = sensor -x, right = sensor +y) -----------
+    # --- photos (upright framing) ------------------------------------------------------
+    # `upright` says how to turn the raw image upright. iPhone exports omit it: cw90, so image
+    # up = sensor -x. Other rigs may store ccw90, 180 or none (already upright).
     photos = []
     pj = os.path.join(a.bundle, 'photos/photos.json')
     for p in (json.load(open(pj)) if os.path.exists(pj) else []):
@@ -174,14 +176,19 @@ def main():
         pm = mat(p['transform'])
         pos = to_room(col(pm, 3))
         fwd = dir_room([-v for v in col(pm, 2)])
-        up = dir_room([-v for v in col(pm, 0)])
-        fx = p['intrinsics'][0]
-        # upright image is height=sensor width; vertical fov spans the sensor's x axis
-        fovY = math.degrees(2 * math.atan(p['width'] / 2 / fx))
+        turn = p.get('upright', 'cw90')
+        sign, axis = {'cw90': (-1, 0), 'ccw90': (1, 0), 'none': (1, 1), '180': (-1, 1)}[turn]
+        up = dir_room([sign * v for v in col(pm, axis)])
+        if axis == 0:  # quarter turn: the upright image's height spans the sensor's x axis
+            fovY = math.degrees(2 * math.atan(p['width'] / 2 / p['intrinsics'][0]))
+            aspect = p['height'] / p['width']
+        else:
+            fovY = math.degrees(2 * math.atan(p['height'] / 2 / p['intrinsics'][4]))
+            aspect = p['width'] / p['height']
         photos.append({
             'file': p['file'], 'position': [round(v, 4) for v in pos], 'forward': [round(v, 5) for v in fwd],
-            'up': [round(v, 5) for v in up], 'fovY': round(fovY, 3), 'aspect': round(p['height'] / p['width'], 5),
-            'blurPixels': p.get('blurPixels'),
+            'up': [round(v, 5) for v in up], 'fovY': round(fovY, 3), 'aspect': round(aspect, 5),
+            'blurPixels': p.get('blurPixels'), 'upright': turn,
         })
 
     result = {

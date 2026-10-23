@@ -163,7 +163,9 @@ with a photo). Use it as the bounding volume for a hand-built piece from the rec
 `transform` is camera-to-world (camera looks down −Z). The image pixels are the raw sensor frame in
 landscape (`width > height`; rotate 90° clockwise to view upright, as EXIF orientation 6 says;
 PIL ignores EXIF by default, which is what you want for projection); `intrinsics` = [fx, 0, 0, 0, fy, 0, cx, cy, 1] (column-major) for
-that image. To find the best photo of something at world point P:
+that image. Bundles from other rigs (`apps/kinect-rig`) may add `upright`: `cw90` (the iPhone case,
+also assumed when absent), `ccw90`, `180` or `none` (already upright); `bundle_to_room.py` and
+`prepare_photos.py` honor it. To find the best photo of something at world point P:
 
 ```js
 // camera-space point; ARKit camera: +x right, +y up, -z forward (in sensor orientation)
