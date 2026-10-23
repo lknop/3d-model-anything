@@ -56,6 +56,9 @@ public class MainActivity extends Activity implements GLSurfaceView.Renderer, Ri
     private long lastStatusMs;
     private long lastFrameCount;
     private boolean showingHold;
+    private int surfaceWidth;
+    private int surfaceHeight;
+    private int displayRotation = -1;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -206,15 +209,21 @@ public class MainActivity extends Activity implements GLSurfaceView.Renderer, Ri
     @Override
     public void onSurfaceChanged(GL10 gl, int width, int height) {
         GLES20.glViewport(0, 0, width, height);
-        if (session != null) {
-            session.setDisplayGeometry(getDisplay().getRotation(), width, height);
-        }
+        surfaceWidth = width;
+        surfaceHeight = height;
+        displayRotation = -1; // re-sent on the next frame
     }
 
     @Override
     public void onDrawFrame(GL10 gl) {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
         if (session == null) return;
+        // A 180-degree flip keeps the surface size, so onSurfaceChanged doesn't see it.
+        int rotation = getDisplay().getRotation();
+        if (rotation != displayRotation) {
+            displayRotation = rotation;
+            session.setDisplayGeometry(rotation, surfaceWidth, surfaceHeight);
+        }
         try {
             session.setCameraTextureName(background.textureId());
             Frame frame = session.update();
