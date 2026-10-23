@@ -33,6 +33,22 @@ PORT = 8765
 MAX_PENDING_WRITES = 90  # three seconds of both streams; beyond that frames are dropped and counted
 
 
+def hold_awake():
+    """Block lid-close suspend, sleep and idle for the recording. logind only grants this to the
+    active local session; over SSH rely on HandleLidSwitchExternalPower=ignore (see README)."""
+    try:
+        lock = subprocess.Popen(['systemd-inhibit', '--what=handle-lid-switch:sleep:idle', '--who=rig_record',
+                                 '--why=recording a scan', '--mode=block', 'sleep', 'infinity'],
+                                stderr=subprocess.PIPE, text=True)
+    except FileNotFoundError:
+        return None
+    time.sleep(0.3)
+    if lock.poll() is not None:
+        print(f'note: cannot hold the laptop awake ({lock.stderr.read().strip()}); closing the lid may suspend it')
+        return None
+    return lock
+
+
 class PhoneLink:
     """The rig phone over `adb forward`: live poses, clock pings, start/stop commands."""
 
@@ -209,6 +225,7 @@ def main():
     signal.signal(signal.SIGINT, lambda *_: stop.set())
 
     phone = kinect = None
+    awake = hold_awake()
     session = {'format': 'kinect-rig/1', 'name': a.name, 'laptopClock': 'time.monotonic_ns',
                'phoneClock': 'SystemClock.elapsedRealtimeNanos'}
     try:
@@ -275,6 +292,8 @@ def main():
                     print(f'pull failed ({e}); retry with: adb pull {session["phoneDir"]} {out}/phone/')
         with open(os.path.join(out, 'session.json'), 'w') as f:
             json.dump(session, f, indent=2)
+        if awake:
+            awake.terminate()
     report(out, session)
 
 

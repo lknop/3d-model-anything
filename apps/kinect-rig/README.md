@@ -36,6 +36,16 @@ uv pip install -p ~/scanrig/.venv/bin/python open3d numpy pillow opencv-python-h
 # JDK 17, Android command-line tools (platform 35, build-tools 35) and Gradle 8.10 to build the app
 ```
 
+Closing the lid suspends the laptop by default, which ends a recording. `rig_record.py` holds a
+systemd inhibitor while recording, but logind grants that only to the active local session. For
+recordings started over SSH, ignore the lid while on external power (a power bank counts):
+
+```sh
+sudo mkdir -p /etc/systemd/logind.conf.d
+printf '[Login]\nHandleLidSwitchExternalPower=ignore\n' | sudo tee /etc/systemd/logind.conf.d/scanrig.conf
+sudo reboot
+```
+
 Build and install the phone app from `android/`: write `local.properties` with
 `sdk.dir=<android-sdk>`, run `JAVA_HOME=<jdk17> gradle assembleDebug`, then
 `adb install -r app/build/outputs/apk/debug/app-debug.apk`. The phone can use USB or
